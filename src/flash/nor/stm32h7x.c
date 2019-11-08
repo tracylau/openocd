@@ -43,6 +43,8 @@
 #define FLASH_OPTCCR    0x24
 #define FLASH_WPSN_CUR  0x38
 #define FLASH_WPSN_PRG  0x3C
+#define FLASH_BOOT_CURR 0x40
+#define FLASH_BOOT_PRGR 0x44
 
 
 /* FLASH_CR register bits */
@@ -107,6 +109,7 @@ struct stm32x_options {
 	uint8_t user_options;
 	uint8_t user2_options;
 	uint8_t user3_options;
+	uint32_t boot_addr;
 };
 
 struct stm32h7x_part_info {
@@ -115,7 +118,6 @@ struct stm32h7x_part_info {
 	const struct stm32h7x_rev *revs;
 	size_t num_revs;
 	unsigned int page_size;
-	unsigned int pages_per_sector;
 	uint16_t max_flash_size_kb;
 	uint8_t has_dual_bank;
 	uint16_t first_bank_size_kb; /* Used when has_dual_bank is true */
@@ -141,7 +143,7 @@ static const struct stm32h7x_part_info stm32h7x_parts[] = {
 	.id					= 0x450,
 	.revs				= stm32_450_revs,
 	.num_revs			= ARRAY_SIZE(stm32_450_revs),
-	.device_str			= "STM32H7xx 2M",
+	.device_str			= "STM32H74x/75x",
 	.page_size			= 128,  /* 128 KB */
 	.max_flash_size_kb	= 2048,
 	.first_bank_size_kb	= 1024,
@@ -339,6 +341,11 @@ static int stm32x_read_options(struct flash_bank *bank)
 		return retval;
 	stm32x_info->option_bytes.protection2 = optiondata & 0xff;
 
+	/* read boot addresses */
+	retval = target_read_u32(target, FLASH_REG_BASE_B0 + FLASH_BOOT_CURR, &stm32x_info->option_bytes.boot_addr);
+	if (retval != ERROR_OK)
+		return retval;
+
 	return ERROR_OK;
 }
 
@@ -354,8 +361,16 @@ static int stm32x_write_options(struct flash_bank *bank)
 	if (retval != ERROR_OK)
 		return retval;
 
+	/* read option register */
+	retval = target_read_u32(target, FLASH_REG_BASE_B0 + FLASH_OPTSR_CUR, &optiondata);
+	if (retval != ERROR_OK)
+		return retval;
+
+	/* keep reserved bits 1 and 26-28 which are masked out from user values */
+	optiondata &= 0x1c000002;
+
 	/* rebuild option data */
-	optiondata = stm32x_info->option_bytes.user_options;
+	optiondata |= stm32x_info->option_bytes.user_options;
 	optiondata |= (stm32x_info->option_bytes.RDP << 8);
 	optiondata |= (stm32x_info->option_bytes.user2_options & 0xff) << 16;
 	optiondata |= (stm32x_info->option_bytes.user3_options & 0xa3) << 24;
@@ -374,6 +389,11 @@ static int stm32x_write_options(struct flash_bank *bank)
 	optiondata = stm32x_info->option_bytes.protection2 & 0xff;
 	/* Program protection WPSNPRG2 */
 	retval = target_write_u32(target, FLASH_REG_BASE_B1 + FLASH_WPSN_PRG, optiondata);
+	if (retval != ERROR_OK)
+		return retval;
+
+	/* Program boot addresses */
+	retval = target_write_u32(target, FLASH_REG_BASE_B0 + FLASH_BOOT_PRGR, stm32x_info->option_bytes.boot_addr);
 	if (retval != ERROR_OK)
 		return retval;
 
@@ -1079,6 +1099,86 @@ COMMAND_HANDLER(stm32x_handle_mass_erase_command)
 	return retval;
 }
 
+COMMAND_HANDLER(stm32x_handle_options_read_command)
+{
+	int retval;
+	struct flash_bank *bank;
+	struct stm32h7x_flash_bank *info;
+
+	if (CMD_ARGC != 1) {
+		command_print(CMD, "stm32h7x options_read <bank>");
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+
+	retval = CALL_COMMAND_HANDLER(flash_command_get_bank, 0, &bank);
+	if (retval != ERROR_OK)
+		return retval;
+
+	retval = stm32x_read_options(bank);
+	if (retval != ERROR_OK)
+		return retval;
+
+	info = bank->driver_priv;
+	command_print(CMD, "stm32h7x user_options 0x%02" PRIX8
+			" user2_options 0x%02" PRIX8
+			" user3_options 0x%02" PRIX8
+			" boot_cm7_add0 0x%04" PRIX32
+			" boot_cm7_add1 0x%04" PRIX32,
+			info->option_bytes.user_options,
+			info->option_bytes.user2_options,
+			info->option_bytes.user3_options,
+			info->option_bytes.boot_addr & 0xffff,
+			info->option_bytes.boot_addr >> 16);
+
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(stm32x_handle_options_write_command)
+{
+	int retval;
+	struct flash_bank *bank;
+	struct stm32h7x_flash_bank *info;
+
+	if (CMD_ARGC < 1) {
+		command_print(CMD, "stm32h7x options_write <bank> ...");
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+
+	retval = CALL_COMMAND_HANDLER(flash_command_get_bank, 0, &bank);
+	if (retval != ERROR_OK)
+		return retval;
+	info = bank->driver_priv;
+
+	retval = stm32x_read_options(bank);
+	if (retval != ERROR_OK)
+		return retval;
+
+	if (CMD_ARGC != 4 && CMD_ARGC != 6) {
+		command_print(CMD,
+				"stm32h7x options_write <bank> <user_options> <user2_options> <user3_options> [ <boot_cm7_add0> <boot_cm7_add1> ]");
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+	COMMAND_PARSE_NUMBER(u8, CMD_ARGV[1], info->option_bytes.user_options);
+	if (info->option_bytes.user_options & 0x03) {
+		command_print(CMD, "stm32h7x invalid user_options: bits 0 and 1 cannot be set");
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	}
+	COMMAND_PARSE_NUMBER(u8, CMD_ARGV[2], info->option_bytes.user2_options);
+	COMMAND_PARSE_NUMBER(u8, CMD_ARGV[3], info->option_bytes.user3_options);
+	if (info->option_bytes.user3_options & 0x5c) {
+		command_print(CMD, "stm32h7x invalid user3_options: bits 2, 3, 4, and 6 cannot be set");
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	}
+	if (CMD_ARGC == 6) {
+		uint16_t boot_cm7_addr0, boot_cm7_addr1;
+		COMMAND_PARSE_NUMBER(u16, CMD_ARGV[4], boot_cm7_addr0);
+		COMMAND_PARSE_NUMBER(u16, CMD_ARGV[5], boot_cm7_addr1);
+		info->option_bytes.boot_addr = boot_cm7_addr0 | (((uint32_t) boot_cm7_addr1) << 16);
+	}
+
+	return stm32x_write_options(bank);
+}
+
 static const struct command_registration stm32x_exec_command_handlers[] = {
 	{
 		.name = "lock",
@@ -1100,6 +1200,20 @@ static const struct command_registration stm32x_exec_command_handlers[] = {
 		.mode = COMMAND_EXEC,
 		.usage = "bank_id",
 		.help = "Erase entire flash device.",
+	},
+	{
+		.name = "options_read",
+		.handler = stm32x_handle_options_read_command,
+		.mode = COMMAND_EXEC,
+		.usage = "bank_id",
+		.help = "Read and display device option bytes.",
+	},
+	{
+		.name = "options_write",
+		.handler = stm32x_handle_options_write_command,
+		.mode = COMMAND_EXEC,
+		.usage = "bank_id user_options user2_options user3_options [ boot_cm7_add0 boot_cm7_add1 ]",
+		.help = "Write option bytes.",
 	},
 	COMMAND_REGISTRATION_DONE
 };
